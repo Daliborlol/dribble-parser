@@ -76,6 +76,11 @@ impl<R: Record> TrackBuilder<R> {
         let Some(list) = self.per_key.get_mut(key) else {
             return;
         };
+        // ticks must stay strictly increasing per key even if the server tick ever goes back
+        let t = match list.last() {
+            Some(last) if t < last.0 => last.0,
+            _ => t,
+        };
         let len = list.len();
         let replace_same_tick = matches!(list.last(), Some(last) if last.0 == t);
         if replace_same_tick {
