@@ -396,9 +396,27 @@ fn distance(a: crate::demo::vector::Vector, b: crate::demo::vector::Vector) -> f
     (dx * dx + dy * dy + dz * dz).sqrt()
 }
 
+/// Options of `parse_demo_cache_fallback`: the map's world bounds (dribble.tf takes them from the
+/// map's `conversion.json` `worldBounds` or its `OVERWRITE_MAP_BOUNDARIES` entry). A missing bound
+/// counts as (0, 0, 0).
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct CacheFallbackOptions {
+    #[serde(default)]
+    boundary_min: Option<crate::demo::vector::Vector>,
+    #[serde(default)]
+    boundary_max: Option<crate::demo::vector::Vector>,
+}
+
+/// `fallback` is `None` for the original exports, which keep their exact behaviour. With
+/// `Some(bounds)` the cache also starts when the demo's world bounds are still all zero after the
+/// 100 warmup frames (tow_tetsudo's plhud.nut writes HUD values into m_WorldMins/m_WorldMaxs, and
+/// on some demos they stay zero for the whole demo, so the original rule never starts). Positions
+/// are then offset by `bounds.boundary_min`, and `world` reports the given bounds.
 fn parse_demo_cache_internal(
     buffer: &[u8],
     progress_callback: Option<&js_sys::Function>,
+    fallback: Option<&CacheFallbackOptions>,
 ) -> JsValue {
     let demo = Demo::new(buffer);
     let mut stream = demo.get_stream();
@@ -416,6 +434,11 @@ fn parse_demo_cache_internal(
     let mut start_tick_base: i64 = 0;
     let mut started = false;
     let mut warmup_frames = 0u32;
+    let fallback_world = fallback.map(|f| crate::demo::parser::analyser::World {
+        boundary_min: f.boundary_min.unwrap_or_default(),
+        boundary_max: f.boundary_max.unwrap_or_default(),
+    });
+    let mut started_without_world = false;
 
     let mut tick_base_samples: u32 = 0;
     let mut tick_base_changes: u32 = 0;
@@ -485,12 +508,17 @@ fn parse_demo_cache_internal(
                 && world.boundary_max.x == 0.0
                 && world.boundary_max.y == 0.0
                 && world.boundary_max.z == 0.0);
-            if warmup_frames >= 100 && world_ready {
+            let start_without_world = !world_ready && fallback_world.is_some();
+            if warmup_frames >= 100 && (world_ready || start_without_world) {
                 started = true;
                 start_server_tick = server_tick;
                 start_demo_tick = packet_tick;
                 start_tick_base = server_tick as i64 - packet_tick as i64;
                 cache_builder.position_offset = world.boundary_min;
+                if let (true, Some(bounds)) = (start_without_world, &fallback_world) {
+                    started_without_world = true;
+                    cache_builder.position_offset = bounds.boundary_min;
+                }
             } else {
                 continue;
             }
@@ -1068,10 +1096,23 @@ fn parse_demo_cache_internal(
         &JsValue::from_str("angleScale"),
         &JsValue::from_f64(ANGLE_FIXED_SCALE as f64),
     );
-    let world_js = JsWorld {
-        boundary_min: world.boundary_min,
-        boundary_max: world.boundary_max,
+    let world_js = match (started_without_world, &fallback_world) {
+        (true, Some(bounds)) => JsWorld {
+            boundary_min: bounds.boundary_min,
+            boundary_max: bounds.boundary_max,
+        },
+        _ => JsWorld {
+            boundary_min: world.boundary_min,
+            boundary_max: world.boundary_max,
+        },
     };
+    if fallback.is_some() {
+        let _ = Reflect::set(
+            &result,
+            &JsValue::from_str("startedWithoutWorld"),
+            &JsValue::from_bool(started_without_world),
+        );
+    }
     let world_js = match to_value(&world_js) {
         Ok(value) => value,
         Err(_) => return JsValue::from_str("Failed to serialize world"),
@@ -1261,7 +1302,7 @@ fn parse_demo_cache_internal(
 
 #[wasm_bindgen]
 pub fn parse_demo_cache(buffer: &[u8]) -> JsValue {
-    parse_demo_cache_internal(buffer, None)
+    parse_demo_cache_internal(buffer, None, None)
 }
 
 #[wasm_bindgen]
@@ -1269,7 +1310,29 @@ pub fn parse_demo_cache_with_progress(
     buffer: &[u8],
     progress_callback: js_sys::Function,
 ) -> JsValue {
-    parse_demo_cache_internal(buffer, Some(&progress_callback))
+    parse_demo_cache_internal(buffer, Some(&progress_callback), None)
+}
+
+/// Base cache for demos the committed base parser cannot start (dribble.tf task B1): the same
+/// output as `parse_demo_cache_with_progress`, except that the cache also starts when the demo's
+/// world bounds are still all zero after the warmup. `options` = `{ boundaryMin?, boundaryMax? }`
+/// (the map's bounds); positions are then relative to `boundaryMin` and `world` reports the given
+/// bounds. The result carries `startedWithoutWorld`. Returns an error string for bad options.
+#[wasm_bindgen]
+pub fn parse_demo_cache_fallback(
+    buffer: &[u8],
+    options: JsValue,
+    progress_callback: js_sys::Function,
+) -> JsValue {
+    let fallback = if options.is_undefined() || options.is_null() {
+        CacheFallbackOptions::default()
+    } else {
+        match serde_wasm_bindgen::from_value::<CacheFallbackOptions>(options) {
+            Ok(value) => value,
+            Err(e) => return JsValue::from_str(&format!("bad options: {e}")),
+        }
+    };
+    parse_demo_cache_internal(buffer, Some(&progress_callback), Some(&fallback))
 }
 
 // ---------------------------------------------------------------------------------------------
