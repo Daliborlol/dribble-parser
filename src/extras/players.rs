@@ -138,6 +138,9 @@ pub struct PlayerSlots {
     pub save_me: Option<u32>,
     pub my_weapons: Vec<Option<u32>>,
     pub wearables: Vec<Option<u32>>,
+    /// `_LPT_m_hMyWearables_8.lengthprop8`: the UtlVector length. Elements at or past it are stale (the server
+    /// stops sending them when the vector shrinks), so the loadout reads only the first `length` handles.
+    pub wearables_len: Option<u32>,
     pub scoring: [[Option<u32>; 16]; 2],
     pub item_charge: [Option<u32>; 3],
     /// local xy, local z, non-local xy, non-local z
@@ -200,6 +203,7 @@ pub fn setup_player(ci: &mut ClassInfo) -> Vec<String> {
         save_me: f(ci, "DT_TFPlayer", "m_bSaveMeParity"),
         my_weapons: (0..48).map(|i| ci.elem("m_hMyWeapons", i)).collect(),
         wearables: (0..8).map(|i| ci.elem("_ST_m_hMyWearables_8", i)).collect(),
+        wearables_len: ci.find("_LPT_m_hMyWearables_8", "lengthprop8"),
         scoring: [[None; 16]; 2],
         item_charge: [
             f(ci, "m_flItemChargeMeter", "000"),
@@ -284,6 +288,7 @@ pub fn setup_player(ci: &mut ClassInfo) -> Vec<String> {
     for x in s.my_weapons.iter().chain(s.wearables.iter()) {
         ci.add_dep(*x, D_LOADOUT);
     }
+    ci.add_dep(s.wearables_len, D_LOADOUT);
     for row in s.scoring {
         for x in row {
             ci.add_dep(x, D_SCORING);
@@ -335,6 +340,7 @@ pub fn setup_player(ci: &mut ClassInfo) -> Vec<String> {
     keep.extend(s.ammo);
     keep.extend(s.my_weapons.iter().copied());
     keep.extend(s.wearables.iter().copied());
+    keep.push(s.wearables_len);
     for row in s.scoring {
         keep.extend(row);
     }
@@ -1097,14 +1103,19 @@ impl Ex {
         }
         let mut w = [65535u16; 4];
         let mut m = 0usize;
-        for slot in &s.wearables {
+        // UtlVector length; without the length prop (older demos) every element counts
+        let len = match s.wearables_len {
+            Some(_) => ent.i0(s.wearables_len).clamp(0, 8) as usize,
+            None => s.wearables.len(),
+        };
+        for slot in s.wearables.iter().take(len) {
             if m >= 4 {
                 break;
             }
             let Some(h) = ent.h(*slot) else { continue };
             let Some(wear) = self
                 .ent_by_handle(Some(h))
-                .filter(|e| e.role == Role::Wearable)
+                .filter(|e| e.role == Role::Wearable && !self.wearable_is_disguise(e))
             else {
                 continue;
             };

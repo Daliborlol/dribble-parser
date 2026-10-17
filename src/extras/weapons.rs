@@ -174,16 +174,21 @@ pub fn setup_weapon(ci: &mut ClassInfo) -> Vec<String> {
 pub struct WearableSlots {
     pub def: Option<u32>,
     pub owner: Option<u32>,
+    /// `DT_TFWearable.m_bDisguiseWearable`: the wearables a disguised spy shows for his disguise class. Like
+    /// disguise weapons (rule 2.3.12) they are not part of the spy's loadout.
+    pub disguise: Option<u32>,
 }
 
 pub fn setup_wearable(ci: &mut ClassInfo) -> Vec<String> {
     let s = WearableSlots {
         def: ci.find("DT_ScriptCreatedItem", "m_iItemDefinitionIndex"),
         owner: ci.find("DT_BaseEntity", "m_hOwnerEntity"),
+        disguise: ci.find("DT_TFWearable", "m_bDisguiseWearable"),
     };
     ci.add_dep(s.def, 1);
     ci.add_dep(s.owner, 1);
-    ci.keep_only(&[s.def, s.owner]);
+    ci.add_dep(s.disguise, 1);
+    ci.keep_only(&[s.def, s.owner, s.disguise]);
     ci.slots = Slots::Wearable(s);
     let mut missing = Vec::new();
     if s.def.is_none() {
@@ -350,6 +355,17 @@ impl Ex {
             return 65535;
         };
         def_u16(ent.i(s.def))
+    }
+
+    /// True for a disguise wearable (`m_bDisguiseWearable`), which the loadout skips.
+    pub(crate) fn wearable_is_disguise(&self, ent: &Ent) -> bool {
+        let Some(ci) = self.class_info(ent.class) else {
+            return false;
+        };
+        let Slots::Wearable(s) = &ci.slots else {
+            return false;
+        };
+        ent.i0(s.disguise) != 0
     }
 
     pub(crate) fn wr_create(&mut self, idx: u32, ent: &mut Ent, ci: &ClassInfo, _st: i64) {
