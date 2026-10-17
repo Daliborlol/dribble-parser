@@ -203,9 +203,10 @@ fn run(
     if let Some(t) = truncated {
         ex.warnings.push(format!("truncated at demo tick {t}"));
     }
-    if incomplete {
-        ex.diag
-            .push("packet stream ended early (incomplete demo)".to_string());
+    if incomplete && truncated.is_none() {
+        // the file ended inside a packet (cut or partially downloaded demo)
+        let t = ex.demo_tick;
+        ex.warnings.push(format!("truncated at demo tick {t}"));
     }
     if ex.map.is_empty() {
         ex.map = header.map.clone();
