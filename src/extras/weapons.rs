@@ -55,6 +55,10 @@ const W_OWNER: u32 = 1 << 24;
 const W_DISGUISE: u32 = 1 << 25;
 const W_DEF: u32 = 1 << 26;
 const W_FIRE: u32 = 1 << 27;
+/// A prop of a weapon's local-only tables (`DT_LocalWeaponData`, `DT_LocalTFWeaponData`,
+/// `DT_PipebombLauncherLocalData`, `DT_SniperRifleLocalData`, `DT_LocalTFWeaponMedigunData`, `DT_BuilderLocalData`).
+/// A Delta that changes one marks the owner's local tables live (`PlState::local_live`).
+const W_LOCAL: u32 = 1 << 28;
 
 #[inline(never)]
 pub fn setup_weapon(ci: &mut ClassInfo) -> Vec<String> {
@@ -136,6 +140,17 @@ pub fn setup_weapon(ci: &mut ClassInfo) -> Vec<String> {
     ci.add_dep(s.pipe_count, D_MISC);
     for x in [s.build_state, s.obj_type, s.obj_mode] {
         ci.add_dep(x, D_BUILDER);
+    }
+    for x in [
+        s.last_fire,
+        s.clip1,
+        s.charge_begin,
+        s.med_charge_l,
+        s.sniper_charge,
+        s.pipe_count,
+        s.obj_type,
+    ] {
+        ci.add_dep(x, W_LOCAL);
     }
     ci.keep_only(&[
         s.def,
@@ -265,6 +280,7 @@ impl Ex {
         }
     }
 
+    /// `revived`: the update is the Enter of a dormant weapon, not a Delta.
     pub(crate) fn wp_update(
         &mut self,
         _idx: u32,
@@ -272,6 +288,7 @@ impl Ex {
         ci: &ClassInfo,
         changed: &[(u32, Val)],
         st: i64,
+        revived: bool,
     ) {
         let Slots::Weapon(s) = &ci.slots else { return };
         let w = ent.slot;
@@ -299,6 +316,9 @@ impl Ex {
                 }
                 self.pl.mark(owner as usize, D_WEAPON_DEPS);
             }
+        }
+        if bits & W_LOCAL != 0 && !revived && owner != 255 {
+            self.pl.note_local(owner as usize);
         }
         if bits & W_DISGUISE != 0 && ent.b(s.disguise) {
             if let Some(r) = self.wp.inst.get_mut(w) {

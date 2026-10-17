@@ -760,9 +760,9 @@ impl Ex {
         revived: bool,
     ) {
         match ent.role {
-            Role::Player => self.pl_update(idx, ent, ci, changed, st),
+            Role::Player => self.pl_update(idx, ent, ci, changed, st, revived),
             Role::PlayerResource => self.pr_update(idx, ent, ci, changed, st),
-            Role::Weapon => self.wp_update(idx, ent, ci, changed, st),
+            Role::Weapon => self.wp_update(idx, ent, ci, changed, st, revived),
             Role::Wearable => self.wr_update(idx, ent, ci, changed, st),
             Role::ViewModel => self.vm_update(idx, ent, ci, changed, st),
             Role::Building => self.bl_update(idx, ent, ci, changed, st, revived),
@@ -1207,9 +1207,13 @@ impl Ex {
         a.add("rules", XNode::Bool(obh("rules.ticks")));
         a.add("teams", XNode::Bool(obh("teams.ticks")));
         a.add("watchers", XNode::Bool(obh("watchers.state.ticks")));
+        // A payload or tug-of-war cart needs a team_train_watcher: koth_product has three static func_tracktrain
+        // brushes and no watcher, and cp maps can have hazard trains.
         a.add(
             "carts",
-            XNode::Bool(obh("cart.movers") || obh("cart.trains")),
+            XNode::Bool(
+                obh("watchers.state.ticks") && (obh("cart.movers") || obh("cart.trains")),
+            ),
         );
         a.add("pd", XNode::Bool(obh("pd.ticks")));
         a.add("movers", XNode::Bool(count_of(g("movers"))));

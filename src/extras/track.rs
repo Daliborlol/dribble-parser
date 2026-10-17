@@ -158,6 +158,25 @@ impl<R: Record> TrackBuilder<R> {
             }
         }
     }
+
+    /// Drops every entry of `key`.
+    pub fn clear_key(&mut self, key: usize) {
+        if let Some(list) = self.per_key.get_mut(key) {
+            *list = Vec::new();
+        }
+    }
+
+    /// Rewrites the records of `key`, then drops each entry equal to the entry before it, so the list keeps the
+    /// section 2.4 invariant (a new entry only where a field changes).
+    pub fn map_key(&mut self, key: usize, f: impl Fn(&mut R)) {
+        let Some(list) = self.per_key.get_mut(key) else {
+            return;
+        };
+        for (_, r) in list.iter_mut() {
+            f(r);
+        }
+        list.dedup_by(|later, earlier| later.1.same(&earlier.1));
+    }
 }
 
 /// Empty track fields for an excluded group: `offsets` of length `key_count + 1`, all zero.

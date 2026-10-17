@@ -28,6 +28,10 @@ pub const D_VM0: u32 = 1 << 17;
 pub const D_VM1: u32 = 1 << 18;
 pub const D_ORIGIN: u32 = 1 << 19;
 pub const D_CLASS: u32 = 1 << 20;
+/// A prop of a local-only table (`DT_LocalPlayerExclusive`, `DT_Local`, `m_iAmmo`, `DT_TFPlayerSharedLocal` with
+/// the scoring data and item charge). Not a record bit: a Delta that changes one proves the demo carries this
+/// player's local tables (`PlState::local_live`).
+pub const D_LOCAL: u32 = 1 << 21;
 pub const D_ALL: u32 = (1 << 19) - 1;
 /// Records that depend on owned or active weapons.
 pub const D_WEAPON_DEPS: u32 = D_DISGUISE
@@ -302,6 +306,23 @@ pub fn setup_player(ci: &mut ClassInfo) -> Vec<String> {
     }
     ci.add_dep(s.life, D_ORIGIN);
     ci.add_dep(s.class, D_CLASS);
+    // props of the local-only tables (see D_LOCAL)
+    for x in [
+        s.view_z,
+        s.ducked,
+        s.ducking,
+        s.fov_rate,
+        s.des_team,
+        s.des_class,
+        s.rage,
+    ]
+    .into_iter()
+    .chain(s.ammo)
+    .chain(s.item_charge)
+    .chain(s.scoring.iter().flatten().copied())
+    {
+        ci.add_dep(x, D_LOCAL);
+    }
     // keep only the props read here
     let mut keep: Vec<Option<u32>> = Vec::new();
     keep.extend(s.cond);
@@ -443,6 +464,10 @@ pub struct PlState {
     pub classes: Vec<Vec<u8>>,
     /// medigun records with an item def pushed while the player was a spy (native diagnostics)
     pub spy_medigun_defs: u32,
+    /// Per player: a Delta changed one of his local-only props (`D_LOCAL`) or a local-only prop of a weapon he owns.
+    /// Old SourceTV demos (the 6v6 sample) and the other players of a POV demo never get those tables: the Enter
+    /// carries the instance baseline once and nothing updates it, so `players_out` drops or blanks those values.
+    pub local_live: Vec<bool>,
 }
 
 impl PlState {
@@ -478,6 +503,13 @@ impl PlState {
             org_src: vec![[true, true]; pc],
             classes: vec![Vec::new(); pc],
             spy_medigun_defs: 0,
+            local_live: vec![false; pc],
+        }
+    }
+
+    pub fn note_local(&mut self, p: usize) {
+        if let Some(l) = self.local_live.get_mut(p) {
+            *l = true;
         }
     }
 
@@ -575,6 +607,7 @@ impl Ex {
         to_u8(ent.i0(s.class))
     }
 
+    /// `revived`: the update is the Enter of a dormant entity, not a Delta.
     pub(crate) fn pl_update(
         &mut self,
         _idx: u32,
@@ -582,11 +615,15 @@ impl Ex {
         ci: &ClassInfo,
         changed: &[(u32, Val)],
         _st: i64,
+        revived: bool,
     ) {
         let p = ent.slot as usize;
         let mut bits = 0u32;
         for (i, _) in changed {
             bits |= ci.dep.get(*i as usize).copied().unwrap_or(0);
+        }
+        if bits & D_LOCAL != 0 && !revived {
+            self.pl.note_local(p);
         }
         if bits & D_SCORING != 0 {
             if let super::Slots::Player(s) = &ci.slots {
@@ -1170,9 +1207,71 @@ impl Ex {
         })
     }
 
+    /// Players whose local-only tables never updated after their Enter (`PlState::local_live`) keep only what the
+    /// shared tables say. Their entries in the purely local tracks (view, ammo, scoring, itemCharge, sniper) are
+    /// dropped, and the local-only fields of the other records read as unknown: `wstate.clip` -1,
+    /// `wstate.chargeTick` NaN, `misc.rage` and `misc.stickies` 0, `disguise.desiredTeam`/`desiredCls` 0,
+    /// `fov.rate` 0, `builder.type` 255. Then `available` reports those groups false (section 3.9), so the
+    /// frontend uses its fallbacks instead of values frozen at signon.
+    #[inline(never)]
+    fn drop_stale_local(&mut self, pc: usize) {
+        let pl = &mut self.pl;
+        // counted over players who played a class, so the SourceTV bot and pure spectators (never live on any
+        // demo) do not raise the warning
+        let (mut live, mut stale) = (0u32, 0u32);
+        for p in 0..pc {
+            let played = pl.classes.get(p).map(|c| !c.is_empty()).unwrap_or(false);
+            if pl.local_live.get(p).copied().unwrap_or(false) {
+                live += played as u32;
+                continue;
+            }
+            let had = pl.view.key_len(p)
+                + pl.ammo.key_len(p)
+                + pl.item_charge.key_len(p)
+                + pl.sniper.key_len(p)
+                + pl.scoring.iter().map(|t| t.key_len(p)).sum::<usize>()
+                > 0;
+            if had && played {
+                stale += 1;
+            }
+            pl.view.clear_key(p);
+            pl.ammo.clear_key(p);
+            pl.item_charge.clear_key(p);
+            pl.sniper.clear_key(p);
+            for t in pl.scoring.iter_mut() {
+                t.clear_key(p);
+            }
+            pl.wstate.map_key(p, |r| {
+                r.clip = -1;
+                r.charge_tick = f32::NAN;
+            });
+            pl.misc.map_key(p, |r| {
+                r.rage = 0;
+                r.stickies = 0;
+            });
+            pl.disguise.map_key(p, |r| {
+                r.desired_team = 0;
+                r.desired_cls = 0;
+            });
+            pl.fov.map_key(p, |r| r.rate = 0.0);
+            pl.builder.map_key(p, |r| r.kind = 255);
+        }
+        self.counts.insert("localTables.live".into(), live as f64);
+        self.counts.insert("localTables.stale".into(), stale as f64);
+        if stale > 0 {
+            self.warnings.push(format!(
+                "local tables never updated after signon for {stale} of {} players: view, ammo, scoring, \
+                 itemCharge and sniper dropped for them; wstate.clip/chargeTick, misc.rage/stickies, \
+                 disguise.desired*, fov.rate and builder.type unknown",
+                stale + live
+            ));
+        }
+    }
+
     #[inline(never)]
     pub(crate) fn players_out(&mut self, ord: &Orders) -> XNode {
         let pc = self.pc();
+        self.drop_stale_local(pc);
         let pl = &mut self.pl;
         // scoring element (section 2.6.4): the element whose m_iKills decreased fewer times
         let dec = pl.kill_decreases;
