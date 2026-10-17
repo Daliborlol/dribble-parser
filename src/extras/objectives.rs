@@ -924,7 +924,14 @@ impl Ex {
                         sim.left = 0.0;
                     }
                 }
+                // The client lets capTimeLeft go negative while the capping team stays on a
+                // finished point, so its bar shows 100 % until the owner change arrives; hold a
+                // tiny positive remainder instead of 0, which would read as "not capping".
+                let finished = sim.left <= 0.0 && !deteriorate;
                 sim.left = sim.left.clamp(0.0, cap_time(cap).max(0.0));
+                if finished && cap > 1 {
+                    sim.left = 1e-9;
+                }
             }
             let len = cap_time(cap);
             let progress = if len > 0.0 && sim.left != 0.0 {
