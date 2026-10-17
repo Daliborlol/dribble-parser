@@ -34,6 +34,7 @@ pub use crate::demo::{
 pub mod codegen;
 pub(crate) mod consthash;
 pub mod demo;
+pub mod extras;
 pub(crate) mod nullhasher;
 
 #[cfg(all(test, feature = "write"))]
@@ -1269,6 +1270,71 @@ pub fn parse_demo_cache_with_progress(
     progress_callback: js_sys::Function,
 ) -> JsValue {
     parse_demo_cache_internal(buffer, Some(&progress_callback))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Highlander extras (contract section 2.2)
+// ---------------------------------------------------------------------------------------------
+
+fn extras_options(options: JsValue) -> std::result::Result<extras::ExtrasOptions, JsValue> {
+    serde_wasm_bindgen::from_value::<extras::ExtrasOptions>(options)
+        .map_err(|e| JsValue::from_str(&format!("bad options: {e}")))
+}
+
+fn extras_run(buffer: &[u8], opts: &extras::ExtrasOptions, progress_callback: &js_sys::Function) -> std::result::Result<extras::ExtrasOutput, String> {
+    let mut progress = |p: u32| {
+        let _ = progress_callback.call1(&JsValue::NULL, &JsValue::from_f64(p as f64));
+    };
+    extras::parse_extras(buffer, opts, &mut progress)
+}
+
+/// Parses the Highlander extras (`ExtrasRaw`, contract section 2.5) or returns an error string.
+#[wasm_bindgen]
+pub fn parse_demo_extras(buffer: &[u8], options: JsValue, progress_callback: js_sys::Function) -> JsValue {
+    let opts = match extras_options(options) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    match extras_run(buffer, &opts, &progress_callback) {
+        Ok(out) => extras::js::output_to_js(out),
+        Err(e) => JsValue::from_str(&e),
+    }
+}
+
+/// The demo bytes, owned by wasm memory. The worker copies the file in and drops its own
+/// ArrayBuffer before parsing.
+#[wasm_bindgen]
+pub struct ExtrasInput {
+    data: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl ExtrasInput {
+    /// Zero-filled vector of `len` bytes.
+    #[wasm_bindgen(constructor)]
+    pub fn new(len: usize) -> ExtrasInput {
+        ExtrasInput { data: vec![0; len] }
+    }
+
+    /// JS: `new Uint8Array(wasm.memory.buffer, input.ptr(), len).set(bytes)`
+    pub fn ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+}
+
+/// Same result as `parse_demo_extras`. Consumes and frees `input` before the JS output is built.
+#[wasm_bindgen]
+pub fn parse_demo_extras_input(input: ExtrasInput, options: JsValue, progress_callback: js_sys::Function) -> JsValue {
+    let opts = match extras_options(options) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let result = extras_run(&input.data, &opts, &progress_callback);
+    drop(input);
+    match result {
+        Ok(out) => extras::js::output_to_js(out),
+        Err(e) => JsValue::from_str(&e),
+    }
 }
 
 #[derive(Default)]

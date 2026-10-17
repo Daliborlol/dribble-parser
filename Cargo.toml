@@ -47,6 +47,10 @@ name = "direct_hits"
 path = "src/bin/direct_hits.rs"
 
 [[bin]]
+name = "hl_extras"
+path = "src/bin/hl_extras.rs"
+
+[[bin]]
 name = "hl_probe"
 path = "src/bin/hl_probe.rs"
 required-features = ["write"]
@@ -103,6 +107,11 @@ insta = { version = "1.39.0", features = ["json"] }
 
 [profile.release]
 lto = "thin"
+
+# Binaryen inlines every single-caller function by default, which turned the packet loop into
+# 100-300 KB wasm functions; V8 then needed up to 170 MB per TurboFan compile (hlextras worker).
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--one-caller-inline-max-function-size", "200"]
 
 [profile.bench]
 debug = true
