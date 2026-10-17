@@ -46,6 +46,11 @@ path = "src/bin/strings.rs"
 name = "direct_hits"
 path = "src/bin/direct_hits.rs"
 
+[[bin]]
+name = "hl_probe"
+path = "src/bin/hl_probe.rs"
+required-features = ["write"]
+
 [dependencies]
 bitbuffer = { version = "0.11.3", features = ["serde"] }
 num_enum = "0.7.2"
