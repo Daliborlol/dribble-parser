@@ -146,8 +146,17 @@ impl Class {
     where
         u8: TryFrom<U>,
     {
-        Class::try_from(u8::try_from(number).unwrap_or_default()).unwrap()
+        Class::try_from(u8::try_from(number).unwrap_or_default()).unwrap_or_default()
     }
+}
+
+#[test]
+fn test_class_new_out_of_range() {
+    assert_eq!(Class::Engineer, Class::new(9u8));
+    assert_eq!(Class::Other, Class::new(10u8));
+    assert_eq!(Class::Other, Class::new(255u16));
+    assert_eq!(Class::Other, Class::new(-1i64));
+    assert_eq!(Class::Other, Class::new(1000i64));
 }
 
 #[derive(Default, Debug, Eq, PartialEq, Deserialize, Clone)]
