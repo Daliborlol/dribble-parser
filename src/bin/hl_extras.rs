@@ -740,6 +740,11 @@ fn stats(out: &ExtrasOutput, player_classes: &[Vec<u8>]) -> Value {
                 "pdRedMax": pd_red,
                 "pdBluMax": pd_blu,
                 "teamsEntries": ob.path("teams.ticks").map(|t| t.len()).unwrap_or(0),
+                "prevRed": ob.path("cp.prevRed").map(|t| (0..t.len()).filter_map(|i| t.num_at(i)).collect::<Vec<f64>>()),
+                "prevBlu": ob.path("cp.prevBlu").map(|t| (0..t.len()).filter_map(|i| t.num_at(i)).collect::<Vec<f64>>()),
+                "baseRed": ob.path("cp.baseRed").and_then(|n| n.as_num()),
+                "baseBlu": ob.path("cp.baseBlu").and_then(|n| n.as_num()),
+                "miniRounds": ob.path("cp.miniRounds").and_then(|n| n.as_num()),
             }),
         );
     }
@@ -808,15 +813,125 @@ fn survey(out: &ExtrasOutput, st: &Value) -> Value {
     for k in [5u32, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20] {
         kinds.insert(k.to_string(), json!(pk(k)));
     }
+    let dc = |k: &str| out.diag_counts.get(k).copied().unwrap_or(0.0);
+    let note = |k: &str| out.notes.get(k).cloned().unwrap_or_default();
     json!({
         "map": match out.path("meta.map") { Some(XNode::Str(s)) => s.clone(), _ => String::new() },
         "ticks": out.path("meta.ticks").and_then(|n| n.as_num()),
+        "pickups": pickup_survey(out),
+        "prevPoints": {
+            "entries": dc("survey.prev.entries"),
+            "changes": dc("survey.prev.changes"),
+            "changeTicks": dc("survey.prev.changeTicks"),
+            "firstChangeTick": out.diag_counts.get("survey.prev.firstChangeTick"),
+            "baseChanges": dc("survey.base.changes"),
+            "final": note("prev.final"),
+            "changeTickList": note("prev.changeTicks"),
+            "base": note("base.entries"),
+        },
         "condRising": conds,
         "clientProjectiles": { "17": ck(17), "21": ck(21) },
         "projectileKinds": kinds,
         "dotsLaser1": st.pointer("/dots/laser1").and_then(|v| v.as_u64()).unwrap_or(0),
         "events": { "banner": ev("banner"), "teleported": ev("teleported"), "sapped": ev("sapped"), "deflect": ev("deflect") },
         "uberDeployed": ev("uberDeployed"),
+    })
+}
+
+/// Pickup survey (P2): instances that move (non-empty xform track) by model, plates by size, the rest drop of
+/// moving pickups (first minus last xform z) and pickups created with a move parent.
+fn pickup_survey(out: &ExtrasOutput) -> Value {
+    let Some(pk) = out.group("pickups") else {
+        return Value::Null;
+    };
+    let models = match out.path("strings.models") {
+        Some(XNode::Strs(m)) => m.clone(),
+        _ => Vec::new(),
+    };
+    let n = pk.get("count").and_then(|c| c.as_num()).unwrap_or(0.0) as usize;
+    let xf = pk.get("xform");
+    let off = xf.and_then(|t| t.get("offsets"));
+    let mut moving = 0u64;
+    let mut moving_by_model: BTreeMap<String, u64> = BTreeMap::new();
+    let mut plates: BTreeMap<String, u64> = BTreeMap::new();
+    let mut by_kind_size: BTreeMap<String, u64> = BTreeMap::new();
+    let mut drops: Vec<f64> = Vec::new();
+    let mut first_off: Vec<f64> = Vec::new();
+    let mut moving_list: Vec<Value> = Vec::new();
+    let mut static_plates: Vec<Value> = Vec::new();
+    for j in 0..n {
+        let model = models
+            .get(col(pk, "model", j) as usize)
+            .cloned()
+            .unwrap_or_default();
+        let kind = col(pk, "kind", j);
+        let size = col(pk, "size", j);
+        *by_kind_size.entry(format!("kind{kind}_size{size}")).or_insert(0) += 1;
+        let is_plate = model
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .starts_with("plate");
+        if is_plate {
+            *plates.entry(format!("{model} size{size}")).or_insert(0) += 1;
+        }
+        let a = off.and_then(|o| o.num_at(j)).unwrap_or(0.0) as usize;
+        let b = off.and_then(|o| o.num_at(j + 1)).unwrap_or(0.0) as usize;
+        if is_plate && b == a {
+            static_plates.push(json!({
+                "instance": j,
+                "model": model,
+                "created": col(pk, "created", j),
+                "deleted": col(pk, "deleted", j),
+                "pos": [col(pk, "x", j), col(pk, "y", j), col(pk, "z", j)],
+            }));
+        }
+        if b > a {
+            moving += 1;
+            *moving_by_model.entry(model.clone()).or_insert(0) += 1;
+            if let Some(t) = xf {
+                let z0 = col(t, "z", a);
+                let z1 = col(t, "z", b - 1);
+                drops.push(z0 - z1);
+                let dx = col(t, "x", a) - col(pk, "x", j);
+                let dy = col(t, "y", a) - col(pk, "y", j);
+                let dz = col(t, "z", a) - col(pk, "z", j);
+                first_off.push((dx * dx + dy * dy + dz * dz).sqrt());
+                if moving_list.len() < 40 {
+                    moving_list.push(json!({
+                        "instance": j,
+                        "model": model,
+                        "created": col(pk, "created", j),
+                        "deleted": col(pk, "deleted", j),
+                        "entries": b - a,
+                        "firstTick": col(t, "ticks", a),
+                        "lastTick": col(t, "ticks", b - 1),
+                        "first": [col(t, "x", a), col(t, "y", a), col(t, "z", a)],
+                        "last": [col(t, "x", b - 1), col(t, "y", b - 1), col(t, "z", b - 1)],
+                    }));
+                }
+            }
+        }
+    }
+    let stat = |v: &mut Vec<f64>| -> Value {
+        if v.is_empty() {
+            return Value::Null;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        json!({ "min": v.first(), "median": v.get(v.len() / 2), "max": v.last() })
+    };
+    json!({
+        "count": n,
+        "moving": moving,
+        "movingByModel": moving_by_model,
+        "plates": plates,
+        "kindSize": by_kind_size,
+        "restDrop": stat(&mut drops),
+        "firstEntryOffset": stat(&mut first_off),
+        "parented": out.diag_counts.get("survey.pickups.parented"),
+        "staticPlates": static_plates,
+        "movingList": moving_list,
     })
 }
 

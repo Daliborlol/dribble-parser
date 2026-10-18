@@ -108,6 +108,8 @@ pub struct ExtrasOutput {
     pub align_hit: [bool; 16],
     /// native-only diagnostic counters
     pub diag_counts: BTreeMap<String, f64>,
+    /// native-only diagnostic notes (survey values that are not numbers)
+    pub notes: BTreeMap<String, String>,
     pub gs: Option<GsSamples>,
 }
 
@@ -776,7 +778,7 @@ impl Ex {
             Role::Watcher => self.watcher_update(idx, ent, ci, st),
             Role::Pd => self.pd_update(idx, ent, ci, st),
             Role::Mover => self.mv_update(idx, ent, ci, changed, st, revived),
-            Role::Pickup => self.pk_update(idx, ent, st, revived),
+            Role::Pickup => self.pk_update(idx, ent, ci, changed, st, revived),
             Role::Drop => self.drop_update(idx, ent, ci, changed, st),
             Role::Ragdoll | Role::None => {}
         }
@@ -824,12 +826,7 @@ impl Ex {
             Role::Rules => self.ob.rules_ent = None,
             Role::ObjRes => self.objres_end(ent),
             Role::Mover => self.mv_end(idx, &ent, st),
-            Role::Pickup => self
-                .pk
-                .inst
-                .get_mut(ent.slot)
-                .map(|r| r.deleted = Some(st))
-                .unwrap_or(()),
+            Role::Pickup => self.pk_end(idx, &ent, st),
             Role::Drop => self.drop_end(idx, &ent, st),
             Role::Ragdoll => self
                 .pk
@@ -935,6 +932,7 @@ impl Ex {
             }
         }
         self.pj_finish_positions();
+        let (prev_counts, prev_notes) = self.prev_survey();
         let pc = self.pc();
         let ticks = self.ticks;
 
@@ -1094,6 +1092,11 @@ impl Ex {
         for (k, v) in &self.gev_counts {
             diag_counts.insert(format!("gameEvent.{k}"), *v as f64);
         }
+        diag_counts.extend(prev_counts);
+        diag_counts.insert(
+            "survey.pickups.parented".to_string(),
+            self.pk.parented as f64,
+        );
         ExtrasOutput {
             groups,
             diag: std::mem::take(&mut self.diag),
@@ -1101,6 +1104,7 @@ impl Ex {
             player_classes: std::mem::take(&mut self.pl.classes),
             align_hit: self.al.hit,
             diag_counts,
+            notes: prev_notes,
             gs,
         }
     }

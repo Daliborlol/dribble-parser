@@ -24,6 +24,16 @@ record!(CpStateRec {
 });
 record!(ProgressRec { p: u16 => "p" });
 record!(PdRec { red: u16 => "red", blu: u16 => "blu", max: u16 => "max" });
+record!(
+    /// `m_iPreviousPoints` of one control point for RED and BLU, three slots each (-1 none).
+    PrevRec {
+    red0: i8 => "red0", red1: i8 => "red1", red2: i8 => "red2", blu0: i8 => "blu0", blu1: i8 => "blu1", blu2: i8 => "blu2"
+    }
+);
+record!(
+    /// `m_iBaseControlPoints` of RED and BLU (-1 none) and `m_bPlayingMiniRounds`.
+    BaseRec { red: i8 => "baseRed", blu: i8 => "baseBlu", mini: u8 => "miniRounds" }
+);
 
 pub const RULES_IN_OVERTIME: u16 = 1 << 1;
 
@@ -130,10 +140,22 @@ pub struct ObjResSlots {
     pub req: Vec<Option<u32>>,
     pub cap_time: Vec<Option<u32>>,
     pub can_cap: Vec<Option<u32>>,
+    /// `m_iPreviousPoints` elements 000..191: slot + 3 x point + 24 x team
+    /// (`CBaseTeamObjectiveResource::GetPreviousPointForPoint`)
+    pub prev: Vec<Option<u32>>,
+    /// `m_iBaseControlPoints` elements 000..031 (one per team)
+    pub base: Vec<Option<u32>>,
+    pub mini_rounds: Option<u32>,
 }
 
 const O_RULES: u32 = 1;
 const O_CP: u32 = 2;
+const O_PREV: u32 = 4;
+
+/// Element of `m_iPreviousPoints` for `point`, `team` and `slot` (team_objectiveresource.cpp:424-441).
+pub fn prev_index(point: usize, team: usize, slot: usize) -> usize {
+    slot + point * 3 + team * 8 * 3
+}
 
 #[inline(never)]
 pub fn setup_objres(ci: &mut ClassInfo) -> Vec<String> {
@@ -168,6 +190,9 @@ pub fn setup_objres(ci: &mut ClassInfo) -> Vec<String> {
         req: a64(ci, "m_iTeamReqCappers"),
         cap_time: a64(ci, "m_flTeamCapTime"),
         can_cap: a64(ci, "m_bTeamCanCap"),
+        prev: (0..192).map(|i| ci.elem("m_iPreviousPoints", i)).collect(),
+        base: (0..32).map(|i| ci.elem("m_iBaseControlPoints", i)).collect(),
+        mini_rounds: ci.find(b, "m_bPlayingMiniRounds"),
     };
     let mut missing = Vec::new();
     for (n, x) in [
@@ -223,6 +248,16 @@ pub fn setup_objres(ci: &mut ClassInfo) -> Vec<String> {
     for k in &keep {
         ci.add_dep(*k, O_CP);
     }
+    if s.prev.iter().take(96).any(|x| x.is_none()) {
+        missing.push("m_iPreviousPoints.000..095".to_string());
+    }
+    let mut prev_keep: Vec<Option<u32>> = s.prev.clone();
+    prev_keep.extend(s.base.iter().take(4).copied());
+    prev_keep.push(s.mini_rounds);
+    for k in &prev_keep {
+        ci.add_dep(*k, O_PREV);
+    }
+    keep.extend(prev_keep);
     if let Some(p) = s.positions {
         ci.keep_arrays.push(p);
     }
@@ -411,6 +446,10 @@ pub struct ObState {
     pub watcher_state: TrackBuilder<WatcherRec>,
     pub cp_state: TrackBuilder<CpStateRec>,
     pub cp_progress: TrackBuilder<ProgressRec>,
+    /// previous points per control point (key = point 0..7)
+    pub cp_prev: TrackBuilder<PrevRec>,
+    /// base control points and mini rounds (key 0)
+    pub cp_base: TrackBuilder<BaseRec>,
     pub pd: TrackBuilder<PdRec>,
     pub pd_inst: Vec<(u32, u32, bool)>,
     pub game_type: i64,
@@ -418,6 +457,7 @@ pub struct ObState {
     pub cp_count: i64,
     rules_dirty: bool,
     cp_dirty: bool,
+    prev_dirty: bool,
     last_flags: Option<u16>,
     in_overtime: bool,
     sim: [CpSim; 8],
@@ -438,6 +478,8 @@ impl ObState {
             watcher_state: TrackBuilder::new(ticks),
             cp_state: TrackBuilder::new(ticks),
             cp_progress: TrackBuilder::new(ticks),
+            cp_prev: TrackBuilder::new(ticks),
+            cp_base: TrackBuilder::new(ticks),
             pd: TrackBuilder::new(ticks),
             pd_inst: Vec::new(),
             game_type: 0,
@@ -445,6 +487,7 @@ impl ObState {
             cp_count: 0,
             rules_dirty: false,
             cp_dirty: false,
+            prev_dirty: false,
             last_flags: None,
             in_overtime: false,
             sim: [CpSim::default(); 8],
@@ -500,6 +543,7 @@ impl Ex {
         self.ob.objres_ent = Some(idx);
         self.ob.rules_dirty = true;
         self.ob.cp_dirty = true;
+        self.ob.prev_dirty = true;
     }
 
     pub(crate) fn objres_update(
@@ -519,6 +563,9 @@ impl Ex {
         }
         if bits & O_CP != 0 {
             self.ob.cp_dirty = true;
+        }
+        if bits & O_PREV != 0 {
+            self.ob.prev_dirty = true;
         }
     }
 
@@ -677,6 +724,112 @@ impl Ex {
             self.ob.cp_dirty = false;
             self.cp_push(st);
         }
+        if self.ob.prev_dirty {
+            self.ob.prev_dirty = false;
+            self.prev_push(st);
+        }
+    }
+
+    /// Survey of the previous-point bookkeeping (native diagnostics): how often `m_iPreviousPoints`, the base
+    /// points and the mini-round flag change after their first value, and the final values.
+    pub(crate) fn prev_survey(
+        &self,
+    ) -> (
+        std::collections::BTreeMap<String, f64>,
+        std::collections::BTreeMap<String, String>,
+    ) {
+        let mut counts = std::collections::BTreeMap::new();
+        let mut notes = std::collections::BTreeMap::new();
+        let mut changes = 0usize;
+        let mut entries = 0usize;
+        let mut change_ticks: Vec<u32> = Vec::new();
+        let mut finals: Vec<String> = Vec::new();
+        for key in 0..8usize {
+            let list = self.ob.cp_prev.entries(key);
+            entries += list.len();
+            changes += list.len().saturating_sub(1);
+            for (t, _) in list.iter().skip(1) {
+                change_ticks.push(*t);
+            }
+            if let Some((_, r)) = list.last() {
+                finals.push(format!(
+                    "{}:r[{},{},{}]b[{},{},{}]",
+                    key, r.red0, r.red1, r.red2, r.blu0, r.blu1, r.blu2
+                ));
+            }
+        }
+        change_ticks.sort_unstable();
+        change_ticks.dedup();
+        let base = self.ob.cp_base.entries(0);
+        counts.insert("survey.prev.entries".to_string(), entries as f64);
+        counts.insert("survey.prev.changes".to_string(), changes as f64);
+        counts.insert(
+            "survey.prev.changeTicks".to_string(),
+            change_ticks.len() as f64,
+        );
+        if let Some(t) = change_ticks.first() {
+            counts.insert("survey.prev.firstChangeTick".to_string(), *t as f64);
+        }
+        counts.insert(
+            "survey.base.changes".to_string(),
+            base.len().saturating_sub(1) as f64,
+        );
+        notes.insert("prev.final".to_string(), finals.join(" "));
+        notes.insert(
+            "prev.changeTicks".to_string(),
+            change_ticks
+                .iter()
+                .take(12)
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        notes.insert(
+            "base.entries".to_string(),
+            base.iter()
+                .take(12)
+                .map(|(t, r)| format!("{t}:{}/{}/{}", r.red, r.blu, r.mini))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        (counts, notes)
+    }
+
+    /// Previous points of every control point for RED and BLU, plus the base points and mini rounds.
+    /// A prop the demo never sent reads -1 (the server's `ResetControlPoints` value).
+    #[inline(never)]
+    fn prev_push(&mut self, st: i64) {
+        if !self.incl.objectives {
+            return;
+        }
+        let Some((ent, ci)) = self.objres_ent() else {
+            return;
+        };
+        let Slots::ObjRes(s) = &ci.slots else { return };
+        let val = |slot: Option<u32>| -> i8 { to_i8(ent.i(slot).unwrap_or(-1)) };
+        let at = |point: usize, team: usize, slot: usize| -> i8 {
+            val(s.prev.get(prev_index(point, team, slot)).copied().flatten())
+        };
+        let mut recs = Vec::with_capacity(8);
+        for i in 0..8usize {
+            recs.push(PrevRec {
+                red0: at(i, 2, 0),
+                red1: at(i, 2, 1),
+                red2: at(i, 2, 2),
+                blu0: at(i, 3, 0),
+                blu1: at(i, 3, 1),
+                blu2: at(i, 3, 2),
+            });
+        }
+        let base = BaseRec {
+            red: val(s.base.get(2).copied().flatten()),
+            blu: val(s.base.get(3).copied().flatten()),
+            mini: u8::from(ent.b(s.mini_rounds)),
+        };
+        for (i, r) in recs.into_iter().enumerate() {
+            self.ob.cp_prev.push(i, st, r);
+        }
+        self.ob.cp_base.push(0, st, base);
     }
 
     #[inline(never)]
@@ -1025,6 +1178,29 @@ impl Ex {
         };
         let mut posv = cp_static.pos.clone();
         posv.resize(24, 0.0);
+        // Previous points, base points and mini rounds (P2): static, because no local demo changes them within
+        // the demo (133-demo survey); the last value wins, -1 / false without an objective resource.
+        let mut prev_red = vec![-1i8; 24];
+        let mut prev_blu = vec![-1i8; 24];
+        for i in 0..8usize {
+            if let Some(r) = self.ob.cp_prev.last(i) {
+                for (slot, (red, blu)) in [(r.red0, r.blu0), (r.red1, r.blu1), (r.red2, r.blu2)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if let Some(c) = prev_red.get_mut(i * 3 + slot) {
+                        *c = red;
+                    }
+                    if let Some(c) = prev_blu.get_mut(i * 3 + slot) {
+                        *c = blu;
+                    }
+                }
+            }
+        }
+        let (base_red, base_blu, mini) = match self.ob.cp_base.last(0) {
+            Some(b) => (b.red, b.blu, b.mini != 0),
+            None => (-1, -1, false),
+        };
         let ob = &mut self.ob;
         let cp_state =
             std::mem::replace(&mut ob.cp_state, TrackBuilder::new(1)).into_fields(8, None);
@@ -1044,6 +1220,11 @@ impl Ex {
             .put("scales", XNode::U8(pad(cp_static.scales.clone())))
             .put("state", XNode::Obj(cp_state))
             .put("progress", XNode::Obj(cp_progress))
+            .put("prevRed", XNode::I8(prev_red))
+            .put("prevBlu", XNode::I8(prev_blu))
+            .put("baseRed", XNode::Num(base_red as f64))
+            .put("baseBlu", XNode::Num(base_blu as f64))
+            .put("miniRounds", XNode::Bool(mini))
             .build();
         let timers_n = to.count();
         let timer_order = to.order.clone();
@@ -1104,6 +1285,11 @@ pub fn objectives_empty() -> XNode {
         .put("scales", XNode::U8(vec![0; 8]))
         .put("state", XNode::Obj(empty_track::<CpStateRec>(8)))
         .put("progress", XNode::Obj(empty_track::<ProgressRec>(8)))
+        .put("prevRed", XNode::I8(vec![-1; 24]))
+        .put("prevBlu", XNode::I8(vec![-1; 24]))
+        .put("baseRed", XNode::Num(-1.0))
+        .put("baseBlu", XNode::Num(-1.0))
+        .put("miniRounds", XNode::Bool(false))
         .build();
     ObjB::new()
         .put("gameType", XNode::Num(0.0))

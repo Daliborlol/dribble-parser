@@ -16,6 +16,7 @@ pub enum XfTarget {
     Building(u32),
     Mover(u32),
     Drop(u32),
+    Pickup(u32),
 }
 
 pub struct XfNode {
@@ -414,6 +415,11 @@ impl Ex {
                     self.mv.drop_xform.push(d as usize, st, rec);
                 }
             }
+            XfTarget::Pickup(k) => {
+                if self.incl.pickups {
+                    self.pk.xform.push(k as usize, st, rec);
+                }
+            }
         }
         if depth < 16 {
             let children: Vec<u32> = self.mv.children.get(&idx).cloned().unwrap_or_default();
@@ -433,7 +439,7 @@ impl Ex {
         let model_index = ent.i0(s.model);
         let model = self.model_name(model_index).to_string();
         if let Some((kind, size)) = super::pickups::pickup_kind(&model) {
-            self.pk_create(idx, ent, kind, size, model_index, s.origin, st);
+            self.pk_create(idx, ent, kind, size, model_index, s, st);
             return;
         }
         if ci.group == Group::Animating {

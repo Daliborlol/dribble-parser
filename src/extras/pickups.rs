@@ -1,13 +1,17 @@
 //! `pickups` and `ragdolls` groups (section 2.5.7).
 
-use super::movers::VisRec;
+use super::buildings::XformRec;
+use super::movers::{MoverSlots, VisRec, XfTarget};
 use super::out::{ObjB, XNode};
 use super::track::{empty_instances, empty_track, InstanceTable, TrackBuilder};
-use super::tracker::{ClassInfo, Ent, Role};
+use super::tracker::{ClassInfo, Ent, Role, Val};
 use super::{to_u8, Ex, Slots};
 
-/// `/items\/(medkit|ammopack)_(small|medium|large)\.mdl$/` -> (kind, size), or
-/// `/plate[^/]*\.mdl$/` -> (health, medium).
+/// Pickup rule of contract section 2.5.7 as amended in 12.2 item 4, on the model path with forward slashes:
+/// `/items\/(medkit|ammopack)_(small|medium|large)\.mdl$/` -> (kind, size), or the lunchbox plates
+/// `/(^|\/)models\/(items|workshop)\/(.*\/)?plate[^/]*\.mdl$/` -> health, medium, except the chocolate, banana
+/// and fishcake plates, which `CTFLunchBox::SecondaryAttack` drops as `item_healthkit_small`
+/// (tf_weapon_lunchbox.cpp:219-235, models at :65-71) -> health, small.
 pub fn pickup_kind(model: &str) -> Option<(u8, u8)> {
     let m = model.replace('\\', "/");
     if let Some(pos) = m.rfind("items/") {
@@ -22,17 +26,37 @@ pub fn pickup_kind(model: &str) -> Option<(u8, u8)> {
             }
         }
     }
-    let file = m.rsplit('/').next().unwrap_or("");
-    if file.ends_with(".mdl") && m.contains("plate") {
-        // the match must be within the last path component
-        if let Some(pos) = m.rfind("plate") {
-            let tail = m.get(pos..).unwrap_or("");
-            if !tail.contains('/') && tail.ends_with(".mdl") {
-                return Some((0, 1));
-            }
-        }
+    plate_size(&m).map(|size| (0, size))
+}
+
+/// Lunchbox plates whose drop is a small health kit.
+const SMALL_PLATES: [&str; 3] = ["plate_chocolate.mdl", "plate_banana.mdl", "plate_fishcake.mdl"];
+
+/// `(^|/)models/(items|workshop)/(.*/)?plate[^/]*\.mdl$` on a path with forward slashes: the file name starts
+/// with `plate` and ends with `.mdl`, and its directory contains `models/items/` or `models/workshop/` at the
+/// start or right after a `/`. Returns the kit size (0 small, 1 medium).
+fn plate_size(m: &str) -> Option<u8> {
+    let file_start = m.rfind('/').map(|p| p + 1).unwrap_or(0);
+    let file = m.get(file_start..)?;
+    if !(file.starts_with("plate") && file.ends_with(".mdl")) {
+        return None;
     }
-    None
+    let dir = m.get(..file_start)?;
+    let in_tree = ["models/items/", "models/workshop/"].iter().any(|prefix| {
+        let mut from = 0;
+        while let Some(pos) = dir.get(from..).and_then(|d| d.find(prefix)) {
+            let at = from + pos;
+            if at == 0 || dir.as_bytes().get(at - 1) == Some(&b'/') {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    });
+    if !in_tree {
+        return None;
+    }
+    Some(if SMALL_PLATES.contains(&file) { 0 } else { 1 })
 }
 
 #[derive(Clone, Debug)]
@@ -108,7 +132,11 @@ pub struct RagRow {
 pub struct PkState {
     pub inst: InstanceTable<PickupRow>,
     pub vis: TrackBuilder<VisRec>,
+    /// absolute transform per instance (section 2.6.2); kept only for pickups that move after creation
+    pub xform: TrackBuilder<XformRec>,
     pub rag: InstanceTable<RagRow>,
+    /// pickups created with a move parent (native survey)
+    pub parented: u32,
 }
 
 impl PkState {
@@ -116,10 +144,15 @@ impl PkState {
         PkState {
             inst: InstanceTable::new(),
             vis: TrackBuilder::new(ticks),
+            xform: TrackBuilder::new(ticks),
             rag: InstanceTable::new(),
+            parented: 0,
         }
     }
 }
+
+/// Dependency bit of the transform props in `setup_mover` (movers.rs `M_XF`).
+const PK_XF: u32 = 1;
 
 impl Ex {
     #[allow(clippy::too_many_arguments)]
@@ -130,14 +163,14 @@ impl Ex {
         kind: u8,
         size: u8,
         model: i64,
-        origin: Option<u32>,
+        s: &MoverSlots,
         st: i64,
     ) {
         let row = PickupRow {
             kind,
             size,
             model: model.clamp(0, 65535) as u16,
-            pos: ent.v(origin).unwrap_or([0.0; 3]),
+            pos: ent.v(s.origin).unwrap_or([0.0; 3]),
         };
         let k = self.pk.inst.add(idx, st, row);
         ent.role = Role::Pickup;
@@ -145,12 +178,51 @@ impl Ex {
         if self.incl.pickups {
             self.pk.vis.push(k as usize, st, VisRec { v: 1 });
         }
+        if ent.h(s.parent).is_some() {
+            self.pk.parented += 1;
+        }
+        // Thrown lunchbox items and dropped kits fly (CTFPowerup::DropSingleInstance, MOVETYPE_FLYGRAVITY), so
+        // pickups get the absolute-transform bookkeeping of drops; pickups_out keeps the track only when it moved.
+        self.xf_register(
+            idx,
+            ent,
+            s.origin,
+            s.angles,
+            s.ang3,
+            s.parent,
+            XfTarget::Pickup(k),
+            st,
+        );
     }
 
-    pub(crate) fn pk_update(&mut self, _idx: u32, ent: &mut Ent, st: i64, revived: bool) {
+    pub(crate) fn pk_update(
+        &mut self,
+        idx: u32,
+        ent: &mut Ent,
+        ci: &ClassInfo,
+        changed: &[(u32, Val)],
+        st: i64,
+        revived: bool,
+    ) {
+        if let Slots::Mover(s) = &ci.slots {
+            let mut bits = 0u32;
+            for (i, _) in changed {
+                bits |= ci.dep.get(*i as usize).copied().unwrap_or(0);
+            }
+            if bits & PK_XF != 0 {
+                self.xf_local(idx, ent, s.origin, s.angles, s.ang3, s.parent, st);
+            }
+        }
         if revived && self.incl.pickups {
             self.pk.vis.push(ent.slot as usize, st, VisRec { v: 1 });
         }
+    }
+
+    pub(crate) fn pk_end(&mut self, idx: u32, ent: &Ent, st: i64) {
+        if let Some(r) = self.pk.inst.get_mut(ent.slot) {
+            r.deleted = Some(st);
+        }
+        self.xf_unregister(idx);
     }
 
     pub(crate) fn pk_leave(&mut self, ent: &Ent, st: i64) {
@@ -200,6 +272,15 @@ impl Ex {
         let z = t.column(&o, |r| r.data.pos[2]);
         let vis =
             std::mem::replace(&mut self.pk.vis, TrackBuilder::new(1)).into_fields(n, Some(&order));
+        // Static pickups (map kits) keep an empty xform track: only a pickup whose transform changed after its
+        // first entry (a thrown or dropped item) keeps its entries.
+        let mut xf = std::mem::replace(&mut self.pk.xform, TrackBuilder::new(1));
+        for key in 0..self.pk.inst.len() {
+            if xf.key_len(key) <= 1 {
+                xf.clear_key(key);
+            }
+        }
+        let xform = xf.into_fields(n, Some(&order));
         ObjB::new()
             .extend(base)
             .put("kind", kind)
@@ -209,6 +290,7 @@ impl Ex {
             .put("y", y)
             .put("z", z)
             .put("vis", XNode::Obj(vis))
+            .put("xform", XNode::Obj(xform))
             .build()
     }
 
@@ -244,6 +326,7 @@ pub fn pickups_empty() -> XNode {
         .put("y", XNode::F32(Vec::new()))
         .put("z", XNode::F32(Vec::new()))
         .put("vis", XNode::Obj(empty_track::<VisRec>(0)))
+        .put("xform", XNode::Obj(empty_track::<XformRec>(0)))
         .build()
 }
 
